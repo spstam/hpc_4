@@ -128,15 +128,38 @@ __global__ void histogram_lut_kernel(unsigned char* img, int* all_luts, int w, i
     int avg_inc = s_excess[0] / 256;
     s_hist[tid] += avg_inc;
 
-    if(tid==0){
-        int cdf = 0;
-        for (int i = 0; i < 256; ++i) {
-            cdf += s_hist[i];
-            int val = (int)((float)cdf * 255.0f / total_pixels + 0.5f);
-            if (val > 255) val = 255;
-            all_luts[(ty * grid_w + tx) * 256 + i] = val;
+    // Ensure all threads have finished filling s_hist before we start the scan
+    __syncthreads(); 
+
+    // Parallel Prefix Sum (Scan) in Shared Memory
+    for (int stride = 1; stride < 256; stride *= 2) {
+        int temp = 0;
+        if (tid >= stride) {
+            temp = s_hist[tid - stride];
         }
+        __syncthreads(); 
+
+        if (tid >= stride) {
+            s_hist[tid] += temp;
+        }
+        __syncthreads();
     }
+
+    int cdf = s_hist[tid]; 
+
+    int val = (int)((float)cdf * 255.0f / total_pixels + 0.5f);
+    if (val > 255) val = 255;
+
+    all_luts[(ty * grid_w + tx) * 256 + tid] = val;
+    // if(tid==0){
+    //     int cdf = 0;
+    //     for (int i = 0; i < 256; ++i) {
+    //         cdf += s_hist[i];
+    //         int val = (int)((float)cdf * 255.0f / total_pixels + 0.5f);
+    //         if (val > 255) val = 255;
+    //         all_luts[(ty * grid_w + tx) * 256 + i] = val;
+    //     }
+    // }
 }
 
 PGM_IMG apply_clahe_cpu(PGM_IMG img_in) {
@@ -222,8 +245,8 @@ __global__ void render_clahe_kernel(
 
     unsigned int result_packed = 0;
 
-    #pragma unroll
-    for(int i = 0; i < 4; i++) {
+    int i=0;
+    {
         int actual_x = x_chunk * 4 + i;
         unsigned char val = (i == 0) ? p0 : (i == 1) ? p1 : (i == 2) ? p2 : p3;
 
@@ -250,7 +273,90 @@ __global__ void render_clahe_kernel(
 
         result_packed |= ((unsigned int)res_byte << (i * 8));
     }
+    i +=1;
+    {
+        int actual_x = x_chunk * 4 + i;
+        unsigned char val = (i == 0) ? p0 : (i == 1) ? p1 : (i == 2) ? p2 : p3;
 
+        float tx_f = (float)actual_x * INVERSE_TILE_SIZE - 0.5f;
+        int x1 = (int)floor(tx_f);
+        int x2 = x1 + 1;
+        float xw = tx_f - x1;
+
+        x1 = max(x1, 0);
+        x2 = min(x2, grid_w - 1);
+
+        int tl = all_luts[(wy1 + x1) * 256 + val];
+        int tr = all_luts[(wy1 + x2) * 256 + val];
+        int bl = all_luts[(wy2 + x1) * 256 + val];
+        int br = all_luts[(wy2 + x2) * 256 + val];
+
+        float w_tl = (1.0f - xw) * (1.0f - yw);
+        float w_tr = xw * (1.0f - yw);
+        float w_bl = (1.0f - xw) * yw;
+        float w_br = xw * yw;
+
+        float res_float = w_tl * tl + w_tr * tr + w_bl * bl + w_br * br;
+        unsigned char res_byte = (unsigned char)(res_float + 0.5f);
+
+        result_packed |= ((unsigned int)res_byte << (i * 8));
+    }
+    i +=1;
+    {
+        int actual_x = x_chunk * 4 + i;
+        unsigned char val = (i == 0) ? p0 : (i == 1) ? p1 : (i == 2) ? p2 : p3;
+
+        float tx_f = (float)actual_x * INVERSE_TILE_SIZE - 0.5f;
+        int x1 = (int)floor(tx_f);
+        int x2 = x1 + 1;
+        float xw = tx_f - x1;
+
+        x1 = max(x1, 0);
+        x2 = min(x2, grid_w - 1);
+
+        int tl = all_luts[(wy1 + x1) * 256 + val];
+        int tr = all_luts[(wy1 + x2) * 256 + val];
+        int bl = all_luts[(wy2 + x1) * 256 + val];
+        int br = all_luts[(wy2 + x2) * 256 + val];
+
+        float w_tl = (1.0f - xw) * (1.0f - yw);
+        float w_tr = xw * (1.0f - yw);
+        float w_bl = (1.0f - xw) * yw;
+        float w_br = xw * yw;
+
+        float res_float = w_tl * tl + w_tr * tr + w_bl * bl + w_br * br;
+        unsigned char res_byte = (unsigned char)(res_float + 0.5f);
+
+        result_packed |= ((unsigned int)res_byte << (i * 8));
+    }
+    i +=1;
+    {
+        int actual_x = x_chunk * 4 + i;
+        unsigned char val = (i == 0) ? p0 : (i == 1) ? p1 : (i == 2) ? p2 : p3;
+
+        float tx_f = (float)actual_x * INVERSE_TILE_SIZE - 0.5f;
+        int x1 = (int)floor(tx_f);
+        int x2 = x1 + 1;
+        float xw = tx_f - x1;
+
+        x1 = max(x1, 0);
+        x2 = min(x2, grid_w - 1);
+
+        int tl = all_luts[(wy1 + x1) * 256 + val];
+        int tr = all_luts[(wy1 + x2) * 256 + val];
+        int bl = all_luts[(wy2 + x1) * 256 + val];
+        int br = all_luts[(wy2 + x2) * 256 + val];
+
+        float w_tl = (1.0f - xw) * (1.0f - yw);
+        float w_tr = xw * (1.0f - yw);
+        float w_bl = (1.0f - xw) * yw;
+        float w_br = xw * yw;
+
+        float res_float = w_tl * tl + w_tr * tr + w_bl * bl + w_br * br;
+        unsigned char res_byte = (unsigned char)(res_float + 0.5f);
+
+        result_packed |= ((unsigned int)res_byte << (i * 8));
+    }
     unsigned int* out_ptr = (unsigned int*)img_out;
     out_ptr[y * (w >> 2) + x_chunk] = result_packed;
 }
