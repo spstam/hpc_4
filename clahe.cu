@@ -189,48 +189,68 @@ PGM_IMG apply_clahe_cpu(PGM_IMG img_in) {
     return img_out;
 }
 
-
-__global__ void render_clahe_kernel(const unsigned char* __restrict__ img_in, 
+__global__ void render_clahe_kernel(
+    const unsigned char* __restrict__ img_in, 
     unsigned char* __restrict__ img_out, 
     const int* __restrict__ all_luts, 
     int w, int h, int grid_w, int grid_h) 
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int x_chunk = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
-    float ty_f = (float)y / TILE_SIZE - 0.5f;
-    float tx_f = (float)x / TILE_SIZE - 0.5f;
-    int y1 = (int)floor(ty_f), x1 = (int)floor(tx_f);
+
+    if (x_chunk * 4 >= w || y >= h) return;
+
+    float ty_f = (float)y * INVERSE_TILE_SIZE - 0.5f;
+    int y1 = (int)floor(ty_f);
     int y2 = y1 + 1;
-    int x2 = x1 + 1;
-
-    float xw = tx_f - x1, yw = ty_f - y1;
-
-    x1= max(x1,0);
-    x2= min(x2,grid_w-1);
-    y1= max(y1,0);
-    y2= min(y2,grid_h-1); 
+    float yw = ty_f - y1;
+    
+    y1 = max(y1, 0);
+    y2 = min(y2, grid_h - 1);
 
     int wy1 = y1 * grid_w;
     int wy2 = y2 * grid_w;
 
-    int val = img_in[y * w + x];
-    int tl = all_luts[(wy1 + x1) * 256 + val];
-    int tr = all_luts[(wy1 + x2) * 256 + val];
-    int bl = all_luts[(wy2 + x1) * 256 + val];
-    int br = all_luts[(wy2 + x2) * 256 + val];
+    const unsigned int* in_ptr = (const unsigned int*)img_in;
 
-    float w_tl = (1.0f - xw) * (1.0f - yw);
-    float w_tr = xw * (1.0f - yw);
-    float w_bl = (1.0f - xw) * yw;
-    float w_br = xw * yw;
+    unsigned int raw_input = in_ptr[y * (w >> 2) + x_chunk];
 
-    float result = w_tl * tl;
-    result += w_tr * tr;
-    result += w_bl * bl;
-    result += w_br * br;
+    unsigned char p0 = (raw_input) & 0xFF;
+    unsigned char p1 = (raw_input >> 8) & 0xFF;
+    unsigned char p2 = (raw_input >> 16) & 0xFF;
+    unsigned char p3 = (raw_input >> 24) & 0xFF;
 
-    img_out[y * w + x] = (unsigned char)(result + 0.5f);
+    unsigned int result_packed = 0;
+
+    #pragma unroll
+    for(int i = 0; i < 4; i++) {
+        int actual_x = x_chunk * 4 + i;
+        unsigned char val = (i == 0) ? p0 : (i == 1) ? p1 : (i == 2) ? p2 : p3;
+
+        float tx_f = (float)actual_x * INVERSE_TILE_SIZE - 0.5f;
+        int x1 = (int)floor(tx_f);
+        int x2 = x1 + 1;
+        float xw = tx_f - x1;
+
+        x1 = max(x1, 0);
+        x2 = min(x2, grid_w - 1);
+
+        int tl = all_luts[(wy1 + x1) * 256 + val];
+        int tr = all_luts[(wy1 + x2) * 256 + val];
+        int bl = all_luts[(wy2 + x1) * 256 + val];
+        int br = all_luts[(wy2 + x2) * 256 + val];
+
+        float w_tl = (1.0f - xw) * (1.0f - yw);
+        float w_tr = xw * (1.0f - yw);
+        float w_bl = (1.0f - xw) * yw;
+        float w_br = xw * yw;
+
+        float res_float = w_tl * tl + w_tr * tr + w_bl * bl + w_br * br;
+        unsigned char res_byte = (unsigned char)(res_float + 0.5f);
+
+        result_packed |= ((unsigned int)res_byte << (i * 8));
+    }
+
+    unsigned int* out_ptr = (unsigned int*)img_out;
+    out_ptr[y * (w >> 2) + x_chunk] = result_packed;
 }
-
-

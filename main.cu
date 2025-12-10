@@ -65,7 +65,7 @@ int main(int argc, char *argv[]){
     histogram_lut_kernel<<<hist_grid, hist_block>>>(d_in, d_luts, img_in.w, img_in.h, grid_w, CLIP_LIMIT);
 
     dim3 render_block(32, 32);
-    dim3 render_grid((img_in.w + 31) / 32, (img_in.h + 31) / 32);
+    dim3 render_grid((img_in.w/4 + 31) / 32, (img_in.h + 31) / 32);
     render_clahe_kernel<<<render_grid, render_block>>>(d_in, d_out, d_luts, img_in.w, img_in.h, grid_w, grid_h);
 
     cudaDeviceSynchronize();
