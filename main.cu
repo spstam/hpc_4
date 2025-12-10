@@ -64,44 +64,11 @@ int main(int argc, char *argv[]){
     
     histogram_lut_kernel<<<hist_grid, hist_block>>>(d_in, d_luts, img_in.w, img_in.h, grid_w, CLIP_LIMIT);
 
-    cudaDeviceSynchronize();
-
-    // 2. CREATE TEXTURE OBJECT
-    struct cudaResourceDesc resDesc;
-    memset(&resDesc, 0, sizeof(resDesc));
-    resDesc.resType = cudaResourceTypeLinear;
-    resDesc.res.linear.devPtr = d_luts;
-    resDesc.res.linear.desc.f = cudaChannelFormatKindSigned; // int
-    resDesc.res.linear.desc.x = 32; // 32 bits
-    resDesc.res.linear.sizeInBytes = lut_size;
-
-    struct cudaTextureDesc texDesc;
-    memset(&texDesc, 0, sizeof(texDesc));
-    texDesc.readMode = cudaReadModeElementType; // Read raw ints
-
-    cudaTextureObject_t lut_tex = 0;
-    cudaCreateTextureObject(&lut_tex, &resDesc, &texDesc, NULL);
-
-    // 3. LAUNCH KERNEL (Standard Grid - No dividing width by 4!)
-    dim3 dimBlock(32, 32); 
-    dim3 dimGrid((img_in.w + dimBlock.x - 1) / dimBlock.x, 
-                 (img_in.h + dimBlock.y - 1) / dimBlock.y);
-
-    render_clahe_kernel_texture<<<dimGrid, dimBlock>>>(
-        d_in, 
-        d_out, 
-        lut_tex, // Pass the texture object
-        img_in.w, 
-        img_in.h, 
-        grid_w, 
-        grid_h
-    );
+    dim3 render_block(32, 32);
+    dim3 render_grid((img_in.w/4 + 31) / 32, (img_in.h + 31) / 32);
+    render_clahe_kernel<<<render_grid, render_block>>>(d_in, d_out, d_luts, img_in.w, img_in.h, grid_w, grid_h);
 
     cudaDeviceSynchronize();
-
-    // 4. CLEANUP
-    cudaDestroyTextureObject(lut_tex);
-
     
     //WRITE BACK OUTPUT
     PGM_IMG img_out_gpu;
@@ -129,6 +96,7 @@ int main(int argc, char *argv[]){
     free_pgm(img_in);
     free_pgm(img_out_cpu);
     free_pgm(img_out_gpu);
+    cudaDeviceReset();
     }
     return 0;
 }
