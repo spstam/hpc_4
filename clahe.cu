@@ -128,65 +128,27 @@ __global__ void histogram_lut_kernel(unsigned char* img, int* all_luts, int w, i
     int avg_inc = s_excess[0] / 256;
     s_hist[tid] += avg_inc;
 
-    // Scan utilising intra warp shuffles
     __syncthreads(); 
+    // Parallel Prefix Sum (Scan) in Shared Memory
+    for (int stride = 1; stride < 256; stride *= 2) {
+        int temp = 0;
+        if (tid >= stride) {
+            temp = s_hist[tid - stride];
+        }
+        __syncthreads(); 
 
-    int warp_id = tid / 32; 
-    int lane = tid % 32;
-
-    int val = s_hist[tid];
-
-    unsigned int mask = 0xffffffff;
-    int temp;
-
-    temp = __shfl_up_sync(mask, val, 1);
-    if (lane >= 1) val += temp;
-    temp = __shfl_up_sync(mask, val, 2);
-    if (lane >= 2) val += temp;
-    temp = __shfl_up_sync(mask, val, 4);
-    if (lane >= 4) val += temp;
-    temp = __shfl_up_sync(mask, val, 8);
-    if (lane >= 8) val += temp;
-    temp = __shfl_up_sync(mask, val, 16);
-    if (lane >= 16) val += temp;
-
-    __shared__ int warp_sums[8]; 
-
-    if (lane == 31) {
-        warp_sums[warp_id] = val;
+        if (tid >= stride) {
+            s_hist[tid] += temp;
+        }
+        __syncthreads();
     }
 
-    __syncthreads();
-    //gather warp sums in zero warp
-    if (warp_id == 0 && lane < 8) {
-        int w_val = warp_sums[lane];
+    int cdf = s_hist[tid]; 
 
-        int w_temp = __shfl_up_sync(mask, w_val, 1);
-        if (lane >= 1) w_val += w_temp;
-        w_temp = __shfl_up_sync(mask, w_val, 2);
-        if (lane >= 2) w_val += w_temp;
-        w_temp = __shfl_up_sync(mask, w_val, 4);
-        if (lane >= 4) w_val += w_temp;
-        
-        warp_sums[lane] = w_val;
-    }
+    int val = (int)((float)cdf * 255.0f / total_pixels + 0.5f);
+    if (val > 255) val = 255;
 
-    __syncthreads(); // Wait for the prefix sum of warps to be ready
-    
-    // add the offset of previous warps
-    int block_offset = 0;
-    if (warp_id > 0) {
-        block_offset = warp_sums[warp_id - 1];
-    }
-
-    val += block_offset;
-
-    s_hist[tid] = val; 
-
-    int lut_val = (int)((float)val * 255.0f / total_pixels + 0.5f);
-    if (lut_val > 255) lut_val = 255;
-
-    all_luts[(ty * grid_w + tx) * 256 + tid] = lut_val;
+    all_luts[(ty * grid_w + tx) * 256 + tid] = val;
 }
 
 PGM_IMG apply_clahe_cpu(PGM_IMG img_in) {
@@ -239,151 +201,48 @@ PGM_IMG apply_clahe_cpu(PGM_IMG img_in) {
     return img_out;
 }
 
-__global__ void render_clahe_kernel(
-    const unsigned char* __restrict__ img_in, 
+
+__global__ void render_clahe_kernel(const unsigned char* __restrict__ img_in, 
     unsigned char* __restrict__ img_out, 
     const int* __restrict__ all_luts, 
     int w, int h, int grid_w, int grid_h) 
 {
-    int x_chunk = blockIdx.x * blockDim.x + threadIdx.x;
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (x_chunk * 4 >= w || y >= h) return;
-
-    float ty_f = (float)y * INVERSE_TILE_SIZE - 0.5f;
-    int y1 = (int)floor(ty_f);
+    if (x >= w || y >= h) return;
+    float ty_f = (float)y / TILE_SIZE - 0.5f;
+    float tx_f = (float)x / TILE_SIZE - 0.5f;
+    int y1 = (int)floor(ty_f), x1 = (int)floor(tx_f);
     int y2 = y1 + 1;
-    float yw = ty_f - y1;
-    
-    y1 = max(y1, 0);
-    y2 = min(y2, grid_h - 1);
+    int x2 = x1 + 1;
+
+    float xw = tx_f - x1, yw = ty_f - y1;
+
+    x1= max(x1,0);
+    x2= min(x2,grid_w-1);
+    y1= max(y1,0);
+    y2= min(y2,grid_h-1); 
 
     int wy1 = y1 * grid_w;
     int wy2 = y2 * grid_w;
 
-    const unsigned int* in_ptr = (const unsigned int*)img_in;
+    int val = img_in[y * w + x];
+    int tl = all_luts[(wy1 + x1) * 256 + val];
+    int tr = all_luts[(wy1 + x2) * 256 + val];
+    int bl = all_luts[(wy2 + x1) * 256 + val];
+    int br = all_luts[(wy2 + x2) * 256 + val];
 
-    unsigned int raw_input = in_ptr[y * (w >> 2) + x_chunk];
+    float w_tl = (1.0f - xw) * (1.0f - yw);
+    float w_tr = xw * (1.0f - yw);
+    float w_bl = (1.0f - xw) * yw;
+    float w_br = xw * yw;
 
-    unsigned char p0 = (raw_input) & 0xFF;
-    unsigned char p1 = (raw_input >> 8) & 0xFF;
-    unsigned char p2 = (raw_input >> 16) & 0xFF;
-    unsigned char p3 = (raw_input >> 24) & 0xFF;
+    float result = w_tl * tl;
+    result += w_tr * tr;
+    result += w_bl * bl;
+    result += w_br * br;
 
-    unsigned int result_packed = 0;
-
-    int i=0;
-    {
-        int actual_x = x_chunk * 4 + i;
-        unsigned char val = (i == 0) ? p0 : (i == 1) ? p1 : (i == 2) ? p2 : p3;
-
-        float tx_f = (float)actual_x * INVERSE_TILE_SIZE - 0.5f;
-        int x1 = (int)floor(tx_f);
-        int x2 = x1 + 1;
-        float xw = tx_f - x1;
-
-        x1 = max(x1, 0);
-        x2 = min(x2, grid_w - 1);
-
-        int tl = all_luts[(wy1 + x1) * 256 + val];
-        int tr = all_luts[(wy1 + x2) * 256 + val];
-        int bl = all_luts[(wy2 + x1) * 256 + val];
-        int br = all_luts[(wy2 + x2) * 256 + val];
-
-        float w_tl = (1.0f - xw) * (1.0f - yw);
-        float w_tr = xw * (1.0f - yw);
-        float w_bl = (1.0f - xw) * yw;
-        float w_br = xw * yw;
-
-        float res_float = w_tl * tl + w_tr * tr + w_bl * bl + w_br * br;
-        unsigned char res_byte = (unsigned char)(res_float + 0.5f);
-
-        result_packed |= ((unsigned int)res_byte << (i * 8));
-    }
-    i +=1;
-    {
-        int actual_x = x_chunk * 4 + i;
-        unsigned char val = (i == 0) ? p0 : (i == 1) ? p1 : (i == 2) ? p2 : p3;
-
-        float tx_f = (float)actual_x * INVERSE_TILE_SIZE - 0.5f;
-        int x1 = (int)floor(tx_f);
-        int x2 = x1 + 1;
-        float xw = tx_f - x1;
-
-        x1 = max(x1, 0);
-        x2 = min(x2, grid_w - 1);
-
-        int tl = all_luts[(wy1 + x1) * 256 + val];
-        int tr = all_luts[(wy1 + x2) * 256 + val];
-        int bl = all_luts[(wy2 + x1) * 256 + val];
-        int br = all_luts[(wy2 + x2) * 256 + val];
-
-        float w_tl = (1.0f - xw) * (1.0f - yw);
-        float w_tr = xw * (1.0f - yw);
-        float w_bl = (1.0f - xw) * yw;
-        float w_br = xw * yw;
-
-        float res_float = w_tl * tl + w_tr * tr + w_bl * bl + w_br * br;
-        unsigned char res_byte = (unsigned char)(res_float + 0.5f);
-
-        result_packed |= ((unsigned int)res_byte << (i * 8));
-    }
-    i +=1;
-    {
-        int actual_x = x_chunk * 4 + i;
-        unsigned char val = (i == 0) ? p0 : (i == 1) ? p1 : (i == 2) ? p2 : p3;
-
-        float tx_f = (float)actual_x * INVERSE_TILE_SIZE - 0.5f;
-        int x1 = (int)floor(tx_f);
-        int x2 = x1 + 1;
-        float xw = tx_f - x1;
-
-        x1 = max(x1, 0);
-        x2 = min(x2, grid_w - 1);
-
-        int tl = all_luts[(wy1 + x1) * 256 + val];
-        int tr = all_luts[(wy1 + x2) * 256 + val];
-        int bl = all_luts[(wy2 + x1) * 256 + val];
-        int br = all_luts[(wy2 + x2) * 256 + val];
-
-        float w_tl = (1.0f - xw) * (1.0f - yw);
-        float w_tr = xw * (1.0f - yw);
-        float w_bl = (1.0f - xw) * yw;
-        float w_br = xw * yw;
-
-        float res_float = w_tl * tl + w_tr * tr + w_bl * bl + w_br * br;
-        unsigned char res_byte = (unsigned char)(res_float + 0.5f);
-
-        result_packed |= ((unsigned int)res_byte << (i * 8));
-    }
-    i +=1;
-    {
-        int actual_x = x_chunk * 4 + i;
-        unsigned char val = (i == 0) ? p0 : (i == 1) ? p1 : (i == 2) ? p2 : p3;
-
-        float tx_f = (float)actual_x * INVERSE_TILE_SIZE - 0.5f;
-        int x1 = (int)floor(tx_f);
-        int x2 = x1 + 1;
-        float xw = tx_f - x1;
-
-        x1 = max(x1, 0);
-        x2 = min(x2, grid_w - 1);
-
-        int tl = all_luts[(wy1 + x1) * 256 + val];
-        int tr = all_luts[(wy1 + x2) * 256 + val];
-        int bl = all_luts[(wy2 + x1) * 256 + val];
-        int br = all_luts[(wy2 + x2) * 256 + val];
-
-        float w_tl = (1.0f - xw) * (1.0f - yw);
-        float w_tr = xw * (1.0f - yw);
-        float w_bl = (1.0f - xw) * yw;
-        float w_br = xw * yw;
-
-        float res_float = w_tl * tl + w_tr * tr + w_bl * bl + w_br * br;
-        unsigned char res_byte = (unsigned char)(res_float + 0.5f);
-
-        result_packed |= ((unsigned int)res_byte << (i * 8));
-    }
-    unsigned int* out_ptr = (unsigned int*)img_out;
-    out_ptr[y * (w >> 2) + x_chunk] = result_packed;
+    img_out[y * w + x] = (unsigned char)(result + 0.5f);
 }
+
+
