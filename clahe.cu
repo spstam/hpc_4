@@ -243,21 +243,18 @@ PGM_IMG apply_clahe_cpu(PGM_IMG img_in) {
 __global__ void render_clahe_kernel(
     const unsigned char* __restrict__ img_in,
     unsigned char* __restrict__ img_out,
-    const int* __restrict__ all_luts,
+    cudaTextureObject_t lut_tex, // <--- Texture Object used here
     int w, int h, int grid_w, int grid_h)
 {
     // 1. Calculate Coordinates
-    // x_chunk is the index of the "packet" of 4 pixels
     int x_chunk = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // The actual pixel X coordinate where this chunk starts
     int x_pixel_start = x_chunk * 4;
-    // Boundary check: If the start of this chunk is outside the image, stop.
+
     if (x_pixel_start >= w || y >= h) return;
 
     // 2. Pre-calculate Y-axis interpolation (shared across all 4 pixels)
-    // Note: Using division to strictly match your original "Inf PSNR" logic
     float ty_f = (float)y / TILE_SIZE - 0.5f;
     int y1 = (int)floor(ty_f);
     int y2 = y1 + 1;
@@ -270,27 +267,21 @@ __global__ void render_clahe_kernel(
     int wy2 = y2 * grid_w;
 
     // 3. Safe Memory Loading
-    // We calculate the exact byte index. 
     int base_idx = y * w + x_pixel_start;
     
     unsigned char pixels[4] = {0, 0, 0, 0};
     unsigned char results[4];
 
-    // Check Alignment: 
-    // We can only do a vectorized (int) read if the address is divisible by 4
-    // AND we are not at the very edge of the image (preventing read overflow).
     bool is_aligned = (base_idx % 4 == 0);
     bool is_safe_width = (x_pixel_start + 4 <= w);
 
     if (is_aligned && is_safe_width) {
-        // FAST PATH: Read 4 bytes at once
         unsigned int raw = *(const unsigned int*)&img_in[base_idx];
         pixels[0] = (raw) & 0xFF;
         pixels[1] = (raw >> 8) & 0xFF;
         pixels[2] = (raw >> 16) & 0xFF;
         pixels[3] = (raw >> 24) & 0xFF;
     } else {
-        // SLOW PATH (Fallback): Read bytes individually to prevent crashes/corruption
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
             if (x_pixel_start + i < w) {
@@ -304,7 +295,6 @@ __global__ void render_clahe_kernel(
     for (int i = 0; i < 4; ++i) {
         int actual_x = x_pixel_start + i;
         
-        // Skip processing if this specific pixel in the chunk is out of bounds
         if (actual_x >= w) continue;
 
         unsigned char val = pixels[i];
@@ -318,14 +308,15 @@ __global__ void render_clahe_kernel(
         x1 = max(x1, 0);
         x2 = min(x2, grid_w - 1);
 
-        // Retrieve LUT values
-        // Note: These reads are scattered and dependent on pixel value 'val'
-        int tl = all_luts[(wy1 + x1) * 256 + val];
-        int tr = all_luts[(wy1 + x2) * 256 + val];
-        int bl = all_luts[(wy2 + x1) * 256 + val];
-        int br = all_luts[(wy2 + x2) * 256 + val];
+        // --- TEXTURE LOOKUP START ---
+        // Replacing: all_luts[(wy1 + x1) * 256 + val];
+        // The texture cache handles random access much better than global memory
+        int tl = tex1Dfetch<int>(lut_tex, (wy1 + x1) * 256 + val);
+        int tr = tex1Dfetch<int>(lut_tex, (wy1 + x2) * 256 + val);
+        int bl = tex1Dfetch<int>(lut_tex, (wy2 + x1) * 256 + val);
+        int br = tex1Dfetch<int>(lut_tex, (wy2 + x2) * 256 + val);
+        // --- TEXTURE LOOKUP END ---
 
-        // Bilinear Interpolation
         float w_tl = (1.0f - xw) * (1.0f - yw);
         float w_tr = xw * (1.0f - yw);
         float w_bl = (1.0f - xw) * yw;
@@ -337,7 +328,6 @@ __global__ void render_clahe_kernel(
 
     // 5. Safe Memory Writing
     if (is_aligned && is_safe_width) {
-        // FAST PATH: Pack and write 4 bytes at once
         unsigned int result_packed = 0;
         result_packed |= ((unsigned int)results[0]);
         result_packed |= ((unsigned int)results[1] << 8);
@@ -346,7 +336,6 @@ __global__ void render_clahe_kernel(
         
         *(unsigned int*)&img_out[base_idx] = result_packed;
     } else {
-        // SLOW PATH: Write bytes individually
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
             if (x_pixel_start + i < w) {

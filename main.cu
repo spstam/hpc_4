@@ -64,9 +64,43 @@ int main(int argc, char *argv[]){
     
     histogram_lut_kernel<<<hist_grid, hist_block>>>(d_in, d_luts, img_in.w, img_in.h, grid_w, CLIP_LIMIT);
 
-    dim3 render_block(32, 32);
-    dim3 render_grid((img_in.w/4 + 31) / 32, (img_in.h + 31) / 32);
-    render_clahe_kernel<<<render_grid, render_block>>>(d_in, d_out, d_luts, img_in.w, img_in.h, grid_w, grid_h);
+    struct cudaResourceDesc resDesc;
+    memset(&resDesc, 0, sizeof(resDesc));
+    resDesc.resType = cudaResourceTypeLinear;
+    resDesc.res.linear.devPtr = d_luts;
+    resDesc.res.linear.desc.f = cudaChannelFormatKindSigned; // int
+    resDesc.res.linear.desc.x = 32; // 32 bits
+    resDesc.res.linear.sizeInBytes = lut_size;
+
+    // 2. Create Texture Descriptor
+    struct cudaTextureDesc texDesc;
+    memset(&texDesc, 0, sizeof(texDesc));
+    texDesc.readMode = cudaReadModeElementType; // Read raw int values
+
+    // 3. Create the Object
+    cudaTextureObject_t lut_tex = 0;
+    cudaCreateTextureObject(&lut_tex, &resDesc, &texDesc, NULL);
+
+    // 4. Launch Vectorized Kernel with Texture Object
+    dim3 dimBlock(32, 32); 
+    int width_in_chunks = (img_in.w + 3) / 4; 
+    dim3 dimGrid((width_in_chunks + dimBlock.x - 1) / dimBlock.x, 
+                 (img_in.h + dimBlock.y - 1) / dimBlock.y);
+
+    render_clahe_kernel<<<dimGrid, dimBlock>>>(
+        d_in, 
+        d_out, 
+        lut_tex,
+        img_in.w, 
+        img_in.h, 
+        grid_w, 
+        grid_h
+    );
+
+    cudaDeviceSynchronize();
+    
+    // 5. Cleanup
+    cudaDestroyTextureObject(lut_tex);
 
     cudaDeviceSynchronize();
     
