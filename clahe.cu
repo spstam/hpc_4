@@ -238,48 +238,224 @@ PGM_IMG apply_clahe_cpu(PGM_IMG img_in) {
     return img_out;
 }
 
+// Ensure TILE_SIZE is defined. 
+// If it's a template parameter or defined elsewhere, you can remove this check.
+#ifndef TILE_SIZE
+#define TILE_SIZE 32 // Adjust this to match your specific tile size (e.g., 8, 16, 32)
+#endif
 
-__global__ void render_clahe_kernel(const unsigned char* __restrict__ img_in, 
-    unsigned char* __restrict__ img_out, 
-    const int* __restrict__ all_luts, 
-    int w, int h, int grid_w, int grid_h) 
+// __global__ void render_clahe_kernel(
+//     const unsigned char* __restrict__ img_in,
+//     unsigned char* __restrict__ img_out,
+//     const int* __restrict__ all_luts,
+//     int w, int h, int grid_w, int grid_h)
+// {
+//     // 1. Calculate Coordinates
+//     // x_chunk is the index of the "packet" of 4 pixels
+//     int x_chunk = blockIdx.x * blockDim.x + threadIdx.x;
+//     int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+//     // The actual pixel X coordinate where this chunk starts
+//     int x_pixel_start = x_chunk * 4;
+
+//     // Boundary check: If the start of this chunk is outside the image, stop.
+//     if (x_pixel_start >= w || y >= h) return;
+
+//     // 2. Pre-calculate Y-axis interpolation (shared across all 4 pixels)
+//     // Note: Using division to strictly match your original "Inf PSNR" logic
+//     float ty_f = (float)y / TILE_SIZE - 0.5f;
+//     int y1 = (int)floor(ty_f);
+//     int y2 = y1 + 1;
+//     float yw = ty_f - y1;
+
+//     y1 = max(y1, 0);
+//     y2 = min(y2, grid_h - 1);
+
+//     int wy1 = y1 * grid_w;
+//     int wy2 = y2 * grid_w;
+
+//     // 3. Safe Memory Loading
+//     // We calculate the exact byte index. 
+//     int base_idx = y * w + x_pixel_start;
+    
+//     unsigned char pixels[4] = {0, 0, 0, 0};
+//     unsigned char results[4];
+
+//     // Check Alignment: 
+//     // We can only do a vectorized (int) read if the address is divisible by 4
+//     // AND we are not at the very edge of the image (preventing read overflow).
+//     bool is_aligned = (base_idx % 4 == 0);
+//     bool is_safe_width = (x_pixel_start + 4 <= w);
+
+//     if (is_aligned && is_safe_width) {
+//         // FAST PATH: Read 4 bytes at once
+//         unsigned int raw = *(const unsigned int*)&img_in[base_idx];
+//         pixels[0] = (raw) & 0xFF;
+//         pixels[1] = (raw >> 8) & 0xFF;
+//         pixels[2] = (raw >> 16) & 0xFF;
+//         pixels[3] = (raw >> 24) & 0xFF;
+//     } else {
+//         // SLOW PATH (Fallback): Read bytes individually to prevent crashes/corruption
+//         #pragma unroll
+//         for (int i = 0; i < 4; ++i) {
+//             if (x_pixel_start + i < w) {
+//                 pixels[i] = img_in[base_idx + i];
+//             }
+//         }
+//     }
+
+//     // 4. Processing Loop (Unrolled)
+//     #pragma unroll
+//     for (int i = 0; i < 4; ++i) {
+//         int actual_x = x_pixel_start + i;
+        
+//         // Skip processing if this specific pixel in the chunk is out of bounds
+//         if (actual_x >= w) continue;
+
+//         unsigned char val = pixels[i];
+
+//         // X-axis interpolation logic
+//         float tx_f = (float)actual_x / TILE_SIZE - 0.5f;
+//         int x1 = (int)floor(tx_f);
+//         int x2 = x1 + 1;
+//         float xw = tx_f - x1;
+
+//         x1 = max(x1, 0);
+//         x2 = min(x2, grid_w - 1);
+
+//         // Retrieve LUT values
+//         // Note: These reads are scattered and dependent on pixel value 'val'
+//         int tl = all_luts[(wy1 + x1) * 256 + val];
+//         int tr = all_luts[(wy1 + x2) * 256 + val];
+//         int bl = all_luts[(wy2 + x1) * 256 + val];
+//         int br = all_luts[(wy2 + x2) * 256 + val];
+
+//         // Bilinear Interpolation
+//         float w_tl = (1.0f - xw) * (1.0f - yw);
+//         float w_tr = xw * (1.0f - yw);
+//         float w_bl = (1.0f - xw) * yw;
+//         float w_br = xw * yw;
+
+//         float res_float = w_tl * tl + w_tr * tr + w_bl * bl + w_br * br;
+//         results[i] = (unsigned char)(res_float + 0.5f);
+//     }
+
+//     // 5. Safe Memory Writing
+//     if (is_aligned && is_safe_width) {
+//         // FAST PATH: Pack and write 4 bytes at once
+//         unsigned int result_packed = 0;
+//         result_packed |= ((unsigned int)results[0]);
+//         result_packed |= ((unsigned int)results[1] << 8);
+//         result_packed |= ((unsigned int)results[2] << 16);
+//         result_packed |= ((unsigned int)results[3] << 24);
+        
+//         *(unsigned int*)&img_out[base_idx] = result_packed;
+//     } else {
+//         // SLOW PATH: Write bytes individually
+//         #pragma unroll
+//         for (int i = 0; i < 4; ++i) {
+//             if (x_pixel_start + i < w) {
+//                 img_out[base_idx + i] = results[i];
+//             }
+//         }
+//     }
+// }
+__global__ void render_clahe_kernel_texture(
+    const unsigned char* __restrict__ img_in,
+    unsigned char* __restrict__ img_out,
+    cudaTextureObject_t lut_tex, // Texture object for fast random access
+    int w, int h, int grid_w, int grid_h)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
+
     if (x >= w || y >= h) return;
+
+    // Y-axis interpolation weights
     float ty_f = (float)y / TILE_SIZE - 0.5f;
-    float tx_f = (float)x / TILE_SIZE - 0.5f;
-    int y1 = (int)floor(ty_f), x1 = (int)floor(tx_f);
+    int y1 = (int)floor(ty_f);
     int y2 = y1 + 1;
+    float yw = ty_f - y1;
+
+    // Clamp Y to grid boundaries
+    y1 = max(y1, 0);
+    y2 = min(y2, grid_h - 1);
+
+    // X-axis interpolation weights
+    float tx_f = (float)x / TILE_SIZE - 0.5f;
+    int x1 = (int)floor(tx_f);
     int x2 = x1 + 1;
+    float xw = tx_f - x1;
 
-    float xw = tx_f - x1, yw = ty_f - y1;
+    // Clamp X to grid boundaries
+    x1 = max(x1, 0);
+    x2 = min(x2, grid_w - 1);
 
-    x1= max(x1,0);
-    x2= min(x2,grid_w-1);
-    y1= max(y1,0);
-    y2= min(y2,grid_h-1); 
-
+    // Calculate base indices for the 4 corners
     int wy1 = y1 * grid_w;
     int wy2 = y2 * grid_w;
 
     int val = img_in[y * w + x];
-    int tl = all_luts[(wy1 + x1) * 256 + val];
-    int tr = all_luts[(wy1 + x2) * 256 + val];
-    int bl = all_luts[(wy2 + x1) * 256 + val];
-    int br = all_luts[(wy2 + x2) * 256 + val];
 
+    // --- FAST TEXTURE LOOKUPS ---
+    // tex1Dfetch(textureObject, linearIndex)
+    int tl = tex1Dfetch<int>(lut_tex, (wy1 + x1) * 256 + val);
+    int tr = tex1Dfetch<int>(lut_tex, (wy1 + x2) * 256 + val);
+    int bl = tex1Dfetch<int>(lut_tex, (wy2 + x1) * 256 + val);
+    int br = tex1Dfetch<int>(lut_tex, (wy2 + x2) * 256 + val);
+    // ----------------------------
+
+    // Bilinear Interpolation
     float w_tl = (1.0f - xw) * (1.0f - yw);
     float w_tr = xw * (1.0f - yw);
     float w_bl = (1.0f - xw) * yw;
     float w_br = xw * yw;
 
-    float result = w_tl * tl;
-    result += w_tr * tr;
-    result += w_bl * bl;
-    result += w_br * br;
+    float result = w_tl * tl + w_tr * tr + w_bl * bl + w_br * br;
 
     img_out[y * w + x] = (unsigned char)(result + 0.5f);
 }
+// __global__ void render_clahe_kernel(const unsigned char* __restrict__ img_in, 
+//     unsigned char* __restrict__ img_out, 
+//     const int* __restrict__ all_luts, 
+//     int w, int h, int grid_w, int grid_h) 
+// {
+//     int x = blockIdx.x * blockDim.x + threadIdx.x;
+//     int y = blockIdx.y * blockDim.y + threadIdx.y;
+//     if (x >= w || y >= h) return;
+//     float ty_f = (float)y / TILE_SIZE - 0.5f;
+//     float tx_f = (float)x / TILE_SIZE - 0.5f;
+//     int y1 = (int)floor(ty_f), x1 = (int)floor(tx_f);
+//     int y2 = y1 + 1;
+//     int x2 = x1 + 1;
+
+//     float xw = tx_f - x1, yw = ty_f - y1;
+
+//     x1= max(x1,0);
+//     x2= min(x2,grid_w-1);
+//     y1= max(y1,0);
+//     y2= min(y2,grid_h-1); 
+
+//     int wy1 = y1 * grid_w;
+//     int wy2 = y2 * grid_w;
+
+//     int val = img_in[y * w + x];
+//     int tl = all_luts[(wy1 + x1) * 256 + val];
+//     int tr = all_luts[(wy1 + x2) * 256 + val];
+//     int bl = all_luts[(wy2 + x1) * 256 + val];
+//     int br = all_luts[(wy2 + x2) * 256 + val];
+
+//     float w_tl = (1.0f - xw) * (1.0f - yw);
+//     float w_tr = xw * (1.0f - yw);
+//     float w_bl = (1.0f - xw) * yw;
+//     float w_br = xw * yw;
+
+//     float result = w_tl * tl;
+//     result += w_tr * tr;
+//     result += w_bl * bl;
+//     result += w_br * br;
+
+//     img_out[y * w + x] = (unsigned char)(result + 0.5f);
+// }
 
 
