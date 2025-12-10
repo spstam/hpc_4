@@ -98,6 +98,7 @@ __global__ void histogram_lut_kernel(unsigned char* img, int* all_luts, int w, i
             }
         }
     }
+
     __syncthreads();
     for (int i = tid; i < 256; i += blockDim.x * blockDim.y) {
         if (s_hist[i] > clip_limit) {
@@ -106,16 +107,28 @@ __global__ void histogram_lut_kernel(unsigned char* img, int* all_luts, int w, i
         }
     }
     __syncthreads();
-    if(tid==0){
-        int excess = 0;
-        for (int i = 0; i < 256; ++i) {
-            excess += s_excess[i];
-        }
-        int avg_inc = excess / 256;
-        for (int i = 0; i < 256; ++i) {
-            s_hist[i] += avg_inc;
-        }
 
+    if (tid < 128) s_excess[tid] += s_excess[tid + 128];
+    __syncthreads();
+    if (tid < 64) s_excess[tid] += s_excess[tid + 64];
+    __syncthreads();
+    if (tid < 32) s_excess[tid] += s_excess[tid + 32];
+    __syncthreads();
+    if (tid < 16) s_excess[tid] += s_excess[tid + 16];
+    __syncthreads();
+    if (tid < 8) s_excess[tid] += s_excess[tid + 8];
+    __syncthreads();
+    if (tid < 4) s_excess[tid] += s_excess[tid + 4];
+    __syncthreads();
+    if (tid < 2) s_excess[tid] += s_excess[tid + 2];
+    __syncthreads();
+    if (tid < 1) s_excess[tid] += s_excess[tid + 1];
+    __syncthreads();
+
+    int avg_inc = s_excess[0] / 256;
+    s_hist[tid] += avg_inc;
+
+    if(tid==0){
         int cdf = 0;
         for (int i = 0; i < 256; ++i) {
             cdf += s_hist[i];
@@ -124,7 +137,6 @@ __global__ void histogram_lut_kernel(unsigned char* img, int* all_luts, int w, i
             all_luts[(ty * grid_w + tx) * 256 + i] = val;
         }
     }
-    printf("%d ", all_luts[11]);
 }
 
 PGM_IMG apply_clahe_cpu(PGM_IMG img_in) {
@@ -148,7 +160,6 @@ PGM_IMG apply_clahe_cpu(PGM_IMG img_in) {
             compute_histogram_cpu(img_in.img, w, h, x_start, y_start, actual_w, actual_h, &all_luts[(ty * grid_w + tx) * 256]);
         }
     }
-    printf("%d ", all_luts[11]);
 
 
     // Bilinear Interpolation
