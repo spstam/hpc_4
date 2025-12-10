@@ -129,26 +129,63 @@ __global__ void histogram_lut_kernel(unsigned char* img, int* all_luts, int w, i
     s_hist[tid] += avg_inc;
 
     __syncthreads(); 
-    // Parallel Prefix Sum (Scan) in Shared Memory
-    for (int stride = 1; stride < 256; stride *= 2) {
-        int temp = 0;
-        if (tid >= stride) {
-            temp = s_hist[tid - stride];
-        }
-        __syncthreads(); 
+    // Scan utilising intra warp shuffles
+    int warp_id = tid / 32; 
+    int lane = tid % 32;
 
-        if (tid >= stride) {
-            s_hist[tid] += temp;
-        }
-        __syncthreads();
+    int val = s_hist[tid];
+
+    unsigned int mask = 0xffffffff;
+    int temp;
+
+    temp = __shfl_up_sync(mask, val, 1);
+    if (lane >= 1) val += temp;
+    temp = __shfl_up_sync(mask, val, 2);
+    if (lane >= 2) val += temp;
+    temp = __shfl_up_sync(mask, val, 4);
+    if (lane >= 4) val += temp;
+    temp = __shfl_up_sync(mask, val, 8);
+    if (lane >= 8) val += temp;
+    temp = __shfl_up_sync(mask, val, 16);
+    if (lane >= 16) val += temp;
+
+    __shared__ int warp_sums[8]; 
+
+    if (lane == 31) {
+        warp_sums[warp_id] = val;
     }
 
-    int cdf = s_hist[tid]; 
+    __syncthreads();
+    //gather warp sums in zero warp
+    if (warp_id == 0 && lane < 8) {
+        int w_val = warp_sums[lane];
 
-    int val = (int)((float)cdf * 255.0f / total_pixels + 0.5f);
-    if (val > 255) val = 255;
+        int w_temp = __shfl_up_sync(mask, w_val, 1);
+        if (lane >= 1) w_val += w_temp;
+        w_temp = __shfl_up_sync(mask, w_val, 2);
+        if (lane >= 2) w_val += w_temp;
+        w_temp = __shfl_up_sync(mask, w_val, 4);
+        if (lane >= 4) w_val += w_temp;
+        
+        warp_sums[lane] = w_val;
+    }
 
-    all_luts[(ty * grid_w + tx) * 256 + tid] = val;
+    __syncthreads(); // Wait for the prefix sum of warps to be ready
+    
+    // add the offset of previous warps
+    int block_offset = 0;
+    if (warp_id > 0) {
+        block_offset = warp_sums[warp_id - 1];
+    }
+
+    val += block_offset;
+
+    s_hist[tid] = val; 
+
+    int lut_val = (int)((float)val * 255.0f / total_pixels + 0.5f);
+    if (lut_val > 255) lut_val = 255;
+
+    all_luts[(ty * grid_w + tx) * 256 + tid] = lut_val;
 }
 
 PGM_IMG apply_clahe_cpu(PGM_IMG img_in) {
