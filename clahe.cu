@@ -190,7 +190,11 @@ PGM_IMG apply_clahe_cpu(PGM_IMG img_in) {
 }
 
 
-__global__ void render_clahe_kernel(unsigned char* img_in, unsigned char* img_out, int* all_luts, int w, int h, int grid_w, int grid_h) {
+__global__ void render_clahe_kernel(const unsigned char* __restrict__ img_in, 
+    unsigned char* __restrict__ img_out, 
+    const int* __restrict__ all_luts, 
+    int w, int h, int grid_w, int grid_h) 
+{
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
@@ -199,18 +203,34 @@ __global__ void render_clahe_kernel(unsigned char* img_in, unsigned char* img_ou
     int y1 = (int)floor(ty_f), x1 = (int)floor(tx_f);
     int y2 = y1 + 1;
     int x2 = x1 + 1;
-    float y_weight = ty_f - y1; 
-    float x_weight = tx_f - x1;
-    if (x1 < 0) x1 = 0; if (x2 >= grid_w) x2 = grid_w - 1;
-    if (y1 < 0) y1 = 0; if (y2 >= grid_h) y2 = grid_h - 1;
+
+    float xw = tx_f - x1, yw = ty_f - y1;
+
+    x1= max(x1,0);
+    x2= min(x2,grid_w-1);
+    y1= max(y1,0);
+    y2= min(y2,grid_h-1); 
+
+    int wy1 = y1 * grid_w;
+    int wy2 = y2 * grid_w;
 
     int val = img_in[y * w + x];
-    int tl = all_luts[(y1 * grid_w + x1) * 256 + val];
-    int tr = all_luts[(y1 * grid_w + x2) * 256 + val];
-    int bl = all_luts[(y2 * grid_w + x1) * 256 + val];
-    int br = all_luts[(y2 * grid_w + x2) * 256 + val];
+    int tl = all_luts[(wy1 + x1) * 256 + val];
+    int tr = all_luts[(wy1 + x2) * 256 + val];
+    int bl = all_luts[(wy2 + x1) * 256 + val];
+    int br = all_luts[(wy2 + x2) * 256 + val];
 
-    float top = tl * (1.0f - x_weight) + tr * x_weight;
-    float bot = bl * (1.0f - x_weight) + br * x_weight;
-    img_out[y * w + x] = (unsigned char)(top * (1.0f - y_weight) + bot * y_weight + 0.5f);
+    float w_tl = (1.0f - xw) * (1.0f - yw);
+    float w_tr = xw * (1.0f - yw);
+    float w_bl = (1.0f - xw) * yw;
+    float w_br = xw * yw;
+
+    float result = w_tl * tl;
+    result += w_tr * tr;
+    result += w_bl * bl;
+    result += w_br * br;
+
+    img_out[y * w + x] = (unsigned char)(result + 0.5f);
 }
+
+
