@@ -128,9 +128,8 @@ __global__ void histogram_lut_kernel(unsigned char* img, int* all_luts, int w, i
     int avg_inc = s_excess[0] / 256;
     s_hist[tid] += avg_inc;
 
-    // Scan utilising intra warp shuffles
     __syncthreads(); 
-
+    // Scan utilising intra warp shuffles
     int warp_id = tid / 32; 
     int lane = tid % 32;
 
@@ -239,108 +238,91 @@ PGM_IMG apply_clahe_cpu(PGM_IMG img_in) {
     return img_out;
 }
 
+#include <cuda_runtime.h>
 
-__global__ void render_clahe_kernel(
-    const unsigned char* __restrict__ img_in,
-    unsigned char* __restrict__ img_out,
-    cudaTextureObject_t lut_tex, // <--- Texture Object used here
-    int w, int h, int grid_w, int grid_h)
+// Helper Device Function
+__device__ inline unsigned char calculate_clahe_pixel(
+    int x, int y, 
+    unsigned char val, 
+    int w, int grid_w, int grid_h, 
+    const int* __restrict__ luts) // Changed from texture object to pointer
 {
-    // 1. Calculate Coordinates
-    int x_chunk = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    int x_pixel_start = x_chunk * 4;
-
-    if (x_pixel_start >= w || y >= h) return;
-
-    // 2. Pre-calculate Y-axis interpolation (shared across all 4 pixels)
-    float ty_f = (float)y / TILE_SIZE - 0.5f;
-    int y1 = (int)floor(ty_f);
+    // Standard coordinate calculation
+    float tx_f = x * (1.0f / TILE_SIZE) - 0.5f;
+    float ty_f = y * (1.0f / TILE_SIZE) - 0.5f;
+    
+    int x1 = (int)tx_f;
+    int y1 = (int)ty_f;
+    int x2 = x1 + 1;
     int y2 = y1 + 1;
+
+    float xw = tx_f - x1;
     float yw = ty_f - y1;
 
-    y1 = max(y1, 0);
-    y2 = min(y2, grid_h - 1);
+    // Boundary checks
+    x1 = max(0, x1); x2 = min(grid_w - 1, x2);
+    y1 = max(0, y1); y2 = min(grid_h - 1, y2);
 
-    int wy1 = y1 * grid_w;
-    int wy2 = y2 * grid_w;
+    // Pre-calculate row offsets
+    int row1 = y1 * grid_w;
+    int row2 = y2 * grid_w;
 
-    // 3. Safe Memory Loading
-    int base_idx = y * w + x_pixel_start;
+    // --- CHANGED: Direct Memory Access instead of tex1Dfetch ---
+    // The formula (row + col) * 256 + val remains the same
+    int tl = luts[(row1 + x1) * 256 + val];
+    int tr = luts[(row1 + x2) * 256 + val];
+    int bl = luts[(row2 + x1) * 256 + val];
+    int br = luts[(row2 + x2) * 256 + val];
+
+    // Interpolate
+    float top_val = tl + xw * (tr - tl);
+    float bot_val = bl + xw * (br - bl);
+    float result  = top_val + yw * (bot_val - top_val);
+
+    return (unsigned char)(result + 0.5f);
+}
+
+// Global Kernel
+__global__ void render_clahe_kernel(
+    const unsigned char* __restrict__ img_in, 
+    unsigned char* __restrict__ img_out, 
+    const int* __restrict__ luts, // Changed from texture object to pointer
+    int w, int h, 
+    int grid_w, int grid_h) 
+{
+    // Thread ID now corresponds to an integer (chunk of 4 pixels)
+    int vec_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Check bounds (width is divided by 4)
+    if (vec_x >= w / 4 || y >= h) return;
+
+    // --- 1. READ 4 PIXELS (One 32-bit Load) ---
+    const int* in_ptr_as_int = (const int*)img_in;
+    int packed_pixels = in_ptr_as_int[y * (w / 4) + vec_x];
+
+    // Unpack
+    unsigned char p0 = packed_pixels & 0xFF;         
+    unsigned char p1 = (packed_pixels >> 8) & 0xFF;  
+    unsigned char p2 = (packed_pixels >> 16) & 0xFF; 
+    unsigned char p3 = (packed_pixels >> 24) & 0xFF; 
+
+    // --- 2. PROCESS ---
+    int base_x = vec_x * 4; 
     
-    unsigned char pixels[4] = {0, 0, 0, 0};
-    unsigned char results[4];
+    // Pass the standard pointer 'luts' instead of the texture object
+    unsigned char r0 = calculate_clahe_pixel(base_x + 0, y, p0, w, grid_w, grid_h, luts);
+    unsigned char r1 = calculate_clahe_pixel(base_x + 1, y, p1, w, grid_w, grid_h, luts);
+    unsigned char r2 = calculate_clahe_pixel(base_x + 2, y, p2, w, grid_w, grid_h, luts);
+    unsigned char r3 = calculate_clahe_pixel(base_x + 3, y, p3, w, grid_w, grid_h, luts);
 
-    bool is_aligned = (base_idx % 4 == 0);
-    bool is_safe_width = (x_pixel_start + 4 <= w);
+    // --- 3. WRITE 4 PIXELS (One 32-bit Store) ---
+    int packed_result = 0;
+    packed_result |= r0;
+    packed_result |= (r1 << 8);
+    packed_result |= (r2 << 16);
+    packed_result |= (r3 << 24);
 
-    if (is_aligned && is_safe_width) {
-        unsigned int raw = *(const unsigned int*)&img_in[base_idx];
-        pixels[0] = (raw) & 0xFF;
-        pixels[1] = (raw >> 8) & 0xFF;
-        pixels[2] = (raw >> 16) & 0xFF;
-        pixels[3] = (raw >> 24) & 0xFF;
-    } else {
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            if (x_pixel_start + i < w) {
-                pixels[i] = img_in[base_idx + i];
-            }
-        }
-    }
-
-    // 4. Processing Loop (Unrolled)
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        int actual_x = x_pixel_start + i;
-        
-        if (actual_x >= w) continue;
-
-        unsigned char val = pixels[i];
-
-        // X-axis interpolation logic
-        float tx_f = (float)actual_x / TILE_SIZE - 0.5f;
-        int x1 = (int)floor(tx_f);
-        int x2 = x1 + 1;
-        float xw = tx_f - x1;
-
-        x1 = max(x1, 0);
-        x2 = min(x2, grid_w - 1);
-
-        // --- TEXTURE LOOKUP START ---
-        // Replacing: all_luts[(wy1 + x1) * 256 + val];
-        // The texture cache handles random access much better than global memory
-        int tl = tex1Dfetch<int>(lut_tex, (wy1 + x1) * 256 + val);
-        int tr = tex1Dfetch<int>(lut_tex, (wy1 + x2) * 256 + val);
-        int bl = tex1Dfetch<int>(lut_tex, (wy2 + x1) * 256 + val);
-        int br = tex1Dfetch<int>(lut_tex, (wy2 + x2) * 256 + val);
-        // --- TEXTURE LOOKUP END ---
-
-        float w_tl = (1.0f - xw) * (1.0f - yw);
-        float w_tr = xw * (1.0f - yw);
-        float w_bl = (1.0f - xw) * yw;
-        float w_br = xw * yw;
-
-        float res_float = w_tl * tl + w_tr * tr + w_bl * bl + w_br * br;
-        results[i] = (unsigned char)(res_float + 0.5f);
-    }
-
-    // 5. Safe Memory Writing
-    if (is_aligned && is_safe_width) {
-        unsigned int result_packed = 0;
-        result_packed |= ((unsigned int)results[0]);
-        result_packed |= ((unsigned int)results[1] << 8);
-        result_packed |= ((unsigned int)results[2] << 16);
-        result_packed |= ((unsigned int)results[3] << 24);
-        
-        *(unsigned int*)&img_out[base_idx] = result_packed;
-    } else {
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            if (x_pixel_start + i < w) {
-                img_out[base_idx + i] = results[i];
-            }
-        }
-    }
+    int* out_ptr_as_int = (int*)img_out;
+    out_ptr_as_int[y * (w / 4) + vec_x] = packed_result;
 }

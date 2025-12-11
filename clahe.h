@@ -26,8 +26,10 @@ PGM_IMG apply_clahe_cpu(PGM_IMG img_in);
 __global__ void histogram_lut_kernel(unsigned char* img, int* all_luts, int w, int h, int grid_w, int clip_limit);
 //__global__ void render_clahe_kernel(unsigned char* img_in, unsigned char* img_out, int* all_luts, int w, int h, int grid_w, int grid_h);
 __global__ void render_clahe_kernel(
-    const unsigned char* __restrict__ img_in,
-    unsigned char* __restrict__ img_out,
-    cudaTextureObject_t lut_tex,
-    int w, int h, int grid_w, int grid_h);
+    const unsigned char* __restrict__ img_in, 
+    unsigned char* __restrict__ img_out, 
+    const int* __restrict__ all_luts, 
+    int w, int h, 
+    int grid_w, int grid_h
+);
 #endif
